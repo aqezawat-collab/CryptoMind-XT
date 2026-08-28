@@ -410,12 +410,33 @@ class AIChat:
         """
         for mid in candidates:
             try:
-                self.client.chat.completions.create(
+                # A plain chat completion only proves the model can answer
+                # text — it says nothing about tool/function-calling support.
+                # Some models pass a text-only probe but then never emit a
+                # tool_call, which _call_with_functions relies on for every
+                # trading action. Mirror the exact call shape used in
+                # production (same tools list, same tool_choice="auto") so a
+                # pass here reliably predicts runtime behavior, and phrase
+                # the prompt so a genuinely tool-capable model has an obvious
+                # reason to call get_status.
+                response = self.client.chat.completions.create(
                     model=mid,
-                    messages=[{"role": "user", "content": "ping"}],
-                    max_tokens=1,
+                    messages=[{
+                        "role": "user",
+                        "content": "What is the bot's current status? Use the get_status function to check.",
+                    }],
+                    tools=[{"type": "function", "function": f} for f in FUNCTIONS],
+                    tool_choice="auto",
+                    max_tokens=50,
                     timeout=15,
                 )
+                tool_calls = response.choices[0].message.tool_calls
+                if not tool_calls:
+                    logger.warning(
+                        "AI auto-probe of '%s' answered but issued no tool_call; "
+                        "trying next candidate", mid,
+                    )
+                    continue
                 return mid
             except Exception as e:
                 logger.warning(

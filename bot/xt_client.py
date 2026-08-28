@@ -29,8 +29,18 @@ class XTClient:
     # ---------- signing (mirrors AItradekit MCP exactly) ----------
 
     def _sign_headers(self, path: str, params: dict = None):
+        # Header/message prefix is "validate-", NOT "xt-validate-". Confirmed
+        # against the official XT docs (xt-api repo:
+        # docs/futures/Access Description/signStatement.mdx and
+        # signSteps.mdx), which show validate-appkey / validate-timestamp /
+        # validate-signature / validate-recvwindow / validate-algorithms.
+        # AItradekit's xt_futures.py and xt-exchange-plugin's xt_futures.py /
+        # xt_spot.py currently still use "xt-validate-" — that is a bug
+        # inherited from those repos, not the documented behavior, and it is
+        # the same bug already confirmed here previously to make every
+        # signed call fail.
         ts = str(int(time.time() * 1000))
-        msg = f"xt-validate-appkey={self._ak}&xt-validate-timestamp={ts}"
+        msg = f"validate-appkey={self._ak}&validate-timestamp={ts}"
         if params:
             param_str = "&".join(f"{k}={params[k]}" for k in sorted(params))
             msg += f"#{path}#{param_str}"
@@ -39,11 +49,11 @@ class XTClient:
         sig = hmac.new(self._sk.encode(), msg.encode(), hashlib.sha256).hexdigest()
         return {
             "Content-type": "application/x-www-form-urlencoded",
-            "xt-validate-appkey": self._ak,
-            "xt-validate-timestamp": ts,
-            "xt-validate-signature": sig,
-            "xt-validate-algorithms": "HmacSHA256",
-            "xt-validate-recvwindow": "60000",
+            "validate-appkey": self._ak,
+            "validate-timestamp": ts,
+            "validate-signature": sig,
+            "validate-algorithms": "HmacSHA256",
+            "validate-recvwindow": "60000",
         }
 
     # ---------- transport ----------
