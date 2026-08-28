@@ -40,8 +40,8 @@ class Config:
     GUARD_INTERVAL_SEC: int = 15
     MAX_LOSS_PCT: float = 40.0
     MAX_PROFIT_PCT: float = 500.0
-    BREAKEVEN_THRESHOLD_PCT: float = 8.0
-    TRAILING_STOP_PCT: float = 15.0
+    BREAKEVEN_THRESHOLD_PCT: float = 1.5
+    TRAILING_STOP_PCT: float = 2.0
 
     TRAILING_TRIGGER_ROI_PCT: float = 15.0
     TRAILING_DISTANCE_PCT: float = 0.5
