@@ -54,7 +54,8 @@ class Config:
     REVERSAL_ENABLED: bool = True
     REVERSAL_CONFIDENCE: int = 70
     # How often (seconds) to push a PnL + confidence report even with no events.
-    REPORT_INTERVAL_SEC: int = 300
+    REPORT_INTERVAL_SEC: int = 60
+
 
     @classmethod
     def validate(cls) -> list:
