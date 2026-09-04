@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 from openai import OpenAI
 from config import Config
@@ -17,7 +18,7 @@ logger = logging.getLogger("xt_ai")
 # ---------------------------------------------------------------------------
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_MAX_COMPLETION_TOKENS = 16384
-REASONING_COMPLETION_MODELS = ("gcli/grok-4.5-high", "hy3-free", "big-pickle", "gpt-5")
+REASONING_COMPLETION_MODELS = ("o1", "o3", "o4", "gpt-5")
 
 SYSTEM_PROMPT = """You are an AI Trading Assistant for XT.com Futures.
 
@@ -62,6 +63,10 @@ IMPORTANT FACTS ABOUT XT FUTURES:
 
 IMPORTANT RULES:
 - When the user asks to change settings, use the function calls directly.
+- NEVER imitate a function call in plain text or XML (for example "<tool call
+  set_symbol ...>" or "tool call set_symbol with symbol is ..."). You have real
+  functions; call them through the tools interface only. If you cannot make a
+  real call, explain what you would do and ask for confirmation.
 - Only call open_trade / close_trade / close_all_trades when the user clearly
   asks for that action. Never call them to illustrate what you could do.
 - Always explain what you're doing before calling functions.
@@ -285,6 +290,102 @@ class AIChat:
         "-8b", "-7b", "-4b", "-3b", "-2b", "-1b", "-0.5b",
     )
 
+    # Some (weaker) models cannot emit native tool_calls and instead write the
+    # call as prose/XML, e.g. '<tool call set_symbol with symbol is btc_usdt>'
+    # or 'tool call set_symbol(symbol="btc_usdt")'. _parse_text_tool_call is a
+    # best-effort safety net so those models still get executed.
+    _TEXT_TOOL_PATTERNS = (
+        re.compile(
+            r"<\s*(?:tool|function|invoke)\s+call\s*>\s*"
+            r"(\w+)\s+with\s+(.*?)</\s*(?:tool|function|invoke)\s+call\s*>",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        re.compile(
+            r"\btool\s+call\s+(\w+)\s+with\s+(.+?)(?=\n|$)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\bcall\s+(?:the\s+)?(\w+)\s+function\s+with\s+(.+?)(?=\n|$)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(call|invoke)\s+(\w+)\s*\(\s*(\{.*?\}|[^()\n]*)\)\s*$",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        re.compile(r"\b(\w+)\s*\(\s*(\{.*?\})\)", re.DOTALL),
+    )
+
+    @classmethod
+    def _parse_text_tool_call(cls, content: str):
+        """Return (func_name, args) for a tool call written as text/XML.
+
+        Returns (None, None) when no recognizable call is present. Only names
+        from FUNCTIONS are accepted, so normal prose never triggers execution.
+        """
+        if not content:
+            return None, None
+        known = {f["name"] for f in FUNCTIONS}
+        for pat in cls._TEXT_TOOL_PATTERNS:
+            for m in pat.finditer(content):
+                groups = [g for g in m.groups() if g]
+                if not groups:
+                    continue
+                name = groups[0].strip()
+                rest = groups[1].strip() if len(groups) > 1 else ""
+                if name.lower() not in ("call", "invoke") and name not in known:
+                    continue
+                if name.lower() in ("call", "invoke") and len(groups) > 1:
+                    name = groups[1].strip() if len(groups) > 1 else ""
+                    rest = groups[2].strip() if len(groups) > 2 else ""
+                    if name not in known:
+                        continue
+                if rest.startswith("{"):
+                    try:
+                        parsed = json.loads(rest)
+                        if isinstance(parsed, dict):
+                            return name, parsed
+                    except ValueError:
+                        pass
+                # Prose form: 'symbol is btc_usdt, leverage is 5'
+                pairs = re.findall(r"(\w+)\s+(?:is|=)\s+\"?([^\"\s,}>]+)\"?", rest)
+                if pairs:
+                    return name, {k: v.strip('"\'') for k, v in pairs}
+                if rest and "(" not in name:
+                    return name, rest
+        # Direct name(...) form: get_status(), set_leverage(25),
+        # set_symbol({"symbol": "xrp_usdt"}), close_trade(trade_id=12)
+        for known_name in known:
+            m = re.search(r"\b" + re.escape(known_name) + r"\s*\(\s*([^)]*)\)", content)
+            if not m:
+                continue
+            inside = m.group(1).strip()
+            if not inside:
+                return known_name, {}
+            if inside.startswith("{"):
+                try:
+                    parsed = json.loads(inside)
+                    if isinstance(parsed, dict):
+                        return known_name, parsed
+                except ValueError:
+                    pass
+            kv = re.findall(r"(\w+)\s*[=:]\s*\"?([^\"\s,})]+)\"?", inside)
+            if kv:
+                return known_name, {k: v.strip('"\'') for k, v in kv}
+            # Bare single value, e.g. set_leverage(25): bind it to the
+            # function's first required parameter when there is exactly one.
+            reqs = []
+            for f in FUNCTIONS:
+                if f.get("name") == known_name:
+                    reqs = list(f.get("parameters", {}).get("required") or [])
+                    if not reqs:
+                        reqs = list(
+                            (f.get("parameters", {}).get("properties") or {}).keys()
+                        )[:1]
+                    break
+            if len(reqs) == 1:
+                return known_name, {reqs[0]: inside.strip().strip('"\'')}
+        return None, None
+
     def __init__(self, memory: LongTermMemory):
         self.memory = memory
         self.client = OpenAI(
@@ -415,20 +516,35 @@ class AIChat:
         Name-based ranking (``_rank_models``) is a heuristic: a provider's
         "flash" model may not be free, and the top pick may be under-funded, so
         the best-looking id is not always the one the account can use. Probing
-        each candidate with a 1-token completion guarantees we *start* on a
-        model that genuinely responds — on any OpenAI-compatible endpoint, not
-        just OpenRouter. Falls through on balance/quota errors and any other
-        failure; returns '' only if no candidate answers.
+        each candidate with the production call shape (tools + tool_choice)
+        guarantees we *start* on a model that genuinely emits native
+        tool_calls — models that only imitate calls in prose/XML are rejected.
+        Falls through on balance/quota errors and any other failure; returns ''
+        only if no candidate answers.
         """
         for mid in candidates:
             try:
-                self.client.chat.completions.create(
+                # A plain text probe proves nothing about function calling.
+                # Mirror the production call shape (tools + tool_choice) and
+                # only accept models that actually emit a native tool_call —
+                # models that merely imitate calls in prose/XML are skipped.
+                response = self.client.chat.completions.create(
                     model=mid,
-                    messages=[{"role": "user", "content": "ping"}],
-                    max_tokens=1,
+                    messages=[{
+                        "role": "user",
+                        "content": "What is the bot's current status? Use the get_status function to check.",
+                    }],
+                    tools=[{"type": "function", "function": f} for f in FUNCTIONS],
+                    tool_choice="auto",
+                    max_tokens=512,
                     timeout=15,
                 )
-                return mid
+                if getattr(response.choices[0].message, "tool_calls", None):
+                    return mid
+                logger.warning(
+                    "AI auto-probe of '%s' answered but issued no native "
+                    "tool_call; trying next candidate", mid,
+                )
             except Exception as e:
                 logger.warning(
                     "AI auto-probe of '%s' failed (%s); trying next candidate",
@@ -717,18 +833,21 @@ class AIChat:
         (typical when an endpoint caps output tokens mid-JSON) crash the chat
         loop. Any failure becomes a tool result the model can react to."""
         args = {}
-        if raw_args and raw_args.strip():
-            try:
-                parsed = json.loads(raw_args)
-                if not isinstance(parsed, dict):
-                    return (f"Function {func_name} received non-object arguments "
-                            f"({raw_args[:120]!r}). Please answer in plain text "
-                            "instead of calling functions.")
-            except ValueError:
-                return (f"Function {func_name} arguments were not valid JSON "
-                        f"({raw_args[:120]!r}) - likely truncated output. Please "
-                        "answer in plain text instead of calling functions.")
-            args = parsed
+        if raw_args:
+            if isinstance(raw_args, dict):
+                args = raw_args
+            elif raw_args.strip():
+                try:
+                    parsed = json.loads(raw_args)
+                    if not isinstance(parsed, dict):
+                        return (f"Function {func_name} received non-object arguments "
+                                f"({raw_args[:120]!r}). Please answer in plain text "
+                                "instead of calling functions.")
+                except ValueError:
+                    return (f"Function {func_name} arguments were not valid JSON "
+                            f"({raw_args[:120]!r}) - likely truncated output. Please "
+                            "answer in plain text instead of calling functions.")
+                args = parsed
         try:
             return self.execute_function(func_name, args)
         except KeyError as e:
@@ -824,7 +943,26 @@ class AIChat:
                     "content": result,
                 })
             else:
-                return message.content or ""
+                content = message.content or ""
+                if content:
+                    # Safety net for models that cannot emit native tool_calls
+                    # and instead write them as text/XML (e.g. "<tool call
+                    # set_symbol with symbol is btc_usdt>"). Execute the first
+                    # recognizable call so settings changes actually happen.
+                    func_name, t_args = self._parse_text_tool_call(content)
+                    if func_name:
+                        result = self._execute_safely(func_name, t_args)
+                        messages.append({"role": "assistant", "content": content})
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"(Executed the {func_name} call written in your "
+                                f"reply. Result: {result} Now confirm to the user "
+                                "in one short line what was done.)"
+                            ),
+                        })
+                        continue
+                return content or ""
         return "Max function call rounds exceeded. Please try a more specific request."
 
     def remember(self, key: str, value: str):
