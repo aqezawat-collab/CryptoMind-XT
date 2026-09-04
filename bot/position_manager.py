@@ -4,6 +4,7 @@ import pandas as pd
 from bot.xt_client import XTClient, XTError
 from bot.memory import LongTermMemory
 from bot.risk_manager import RiskManager
+from bot.cache_manager import get_cache
 from config import Config
 
 logger = logging.getLogger("xt_position")
@@ -102,6 +103,79 @@ class PositionManager:
         margin = float(pos.get("isolatedMargin") or 0)
         cs = self.risk.get_contract_size(symbol)
         # ROI on margin: price move as a fraction of entry, amplified by leverage.
+        roi = 0.0
+        if entry > 0 and mark > 0:
+            move = (mark - entry) / entry
+            if position_side == "SHORT":
+                move = -move
+            roi = move * leverage * 100
+        return {
+            "exists": True,
+            "unrealized_pnl": pnl,
+            "roi": roi,
+            "entry_price": entry,
+            "mark_price": mark,
+            "leverage": leverage,
+            "position_size": size,
+            "position_value": size * cs * mark,
+            "margin": margin,
+            "profit_id": pos.get("profitId") or None,
+            "trigger_profit_price": float(pos.get("triggerProfitPrice") or 0),
+            "trigger_stop_price": float(pos.get("triggerStopPrice") or 0),
+            "position_type": pos.get("positionType") or "",
+            "available_close_size": float(pos.get("availableCloseSize") or 0),
+        }
+
+    def get_positions_batch_optimized(self, symbol: str = None) -> dict:
+        """Fetch ALL positions once, indexed by (symbol, position_side).
+
+        Replaces the N+1 query pattern where get_position_pnl() calls
+        get_position() -> get_positions() once per open trade. Call this once
+        and pass the result to get_position_pnl_optimized() to drop 10+ API
+        calls down to 1 for status / report loops.
+
+        Returns {(symbol, position_side): position_dict, ...} for open positions.
+        """
+        try:
+            all_positions = self.xt.get_positions(symbol)
+        except XTError as e:
+            logger.warning(f"Position batch fetch failed: {e}")
+            return {}
+        result = {}
+        for pos in all_positions:
+            sym = pos.get("symbol")
+            side = pos.get("positionSide")
+            size = float(pos.get("positionSize") or 0)
+            if sym and side and size > 0:
+                result[(sym, side)] = pos
+        return result
+
+    def get_position_pnl_optimized(self, symbol: str, position_side: str,
+                                   positions_batch: dict = None) -> dict:
+        """get_position_pnl reusing a pre-fetched batch of positions.
+
+        When positions_batch is provided, no extra API call is made; otherwise
+        it falls back to the single-position fetch (original behavior).
+        """
+        pos = None
+        if positions_batch is not None:
+            pos = positions_batch.get((symbol, position_side))
+        else:
+            pos = self.get_position(symbol, position_side)
+        if not pos:
+            return {"exists": False, "unrealized_pnl": 0.0, "roi": 0.0,
+                    "entry_price": 0.0, "mark_price": 0.0, "leverage": 1,
+                    "position_size": 0, "margin": 0.0, "profit_id": None,
+                    "trigger_profit_price": 0.0, "trigger_stop_price": 0.0}
+        entry = float(pos.get("entryPrice") or 0)
+        mark = float(pos.get("calMarkPrice") or 0)
+        if mark <= 0:
+            mark = self._public_mark_price(symbol)
+        size = float(pos.get("positionSize") or 0)
+        leverage = int(float(pos.get("leverage") or 1))
+        pnl = float(pos.get("floatingPL") or 0)
+        margin = float(pos.get("isolatedMargin") or 0)
+        cs = self.risk.get_contract_size(symbol)
         roi = 0.0
         if entry > 0 and mark > 0:
             move = (mark - entry) / entry
@@ -523,6 +597,15 @@ class PositionManager:
         return tp, sl
 
     def _calculate_atr(self, symbol: str, interval: str, period: int = 14) -> float:
+        # ATR is recomputed every time a TP/SL is calculated (entry, fill
+        # check, reversal, mid-management). Cache it per symbol/interval with a
+        # 120s TTL so it is not re-fetched (kline + pandas) several times per
+        # trade. ATR does not move meaningfully within two minutes, so the
+        # cached value is still accurate for TP/SL placement.
+        cache_key = f"atr_{symbol}_{interval}"
+        cached = get_cache().get(cache_key)
+        if cached is not None:
+            return cached
         try:
             rows = self.xt.get_klines(symbol, interval, limit=period + 10)
         except XTError as e:
@@ -549,7 +632,9 @@ class PositionManager:
             (df["high"] - prev_close).abs(),
             (df["low"] - prev_close).abs(),
         ], axis=1).max(axis=1)
-        return float(tr.tail(period).mean())
+        atr = float(tr.tail(period).mean())
+        get_cache().set(cache_key, atr, ttl_seconds=120.0)
+        return atr
 
     # ---------- closing ----------
 
