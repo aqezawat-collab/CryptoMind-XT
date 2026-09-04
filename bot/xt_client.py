@@ -1,23 +1,55 @@
 import hashlib
 import hmac
 import logging
+import os
 import time
 import requests
 from requests.exceptions import RequestException
 
 logger = logging.getLogger("xt_client")
 
+
 class XTError(Exception):
     pass
 
+
 class XTClient:
-    """XT USDT-M futures REST client — signing and endpoints aligned with
-    the working AItradekit MCP server (xt_tradekit/xt_futures.py).
+    """XT USDT-M futures REST client.
+
+    Signing rules (validated against the live API):
+    - Header keys carry a prefix. The CURRENT official docs (doc.xt.com) and
+      this bot's earlier live tests use "validate-*" (validate-appkey /
+      validate-timestamp / validate-signature). CCXT still sends the older
+      "xt-validate-*". The live server accepts the current documented prefix;
+      if a request ever fails with "invalid signature" and nothing else
+      changed, set the env var XT_SIGN_PREFIX=xt-validate to switch.
+    - Signed string = "<prefix>-appkey=..&<prefix>-timestamp=.." + "#path"
+      [+ "#sorted_params"] where sorted_params is exactly the payload the
+      server reconstructs: for GET the query string, for POST the
+      form-urlencoded BODY. Sending POST params in the query string while the
+      server hashes the (empty) body is the classic cause of
+      "invalid signature" - so POST params go in the body (data=), GET params
+      in the query string.
+
+    CROSS (CROSSED) margin notes:
+    - XT position type value is "CROSSED" (NOT "CROSS"); "ISOLATED" is the
+      other value. set_position_type() normalizes "CROSS" for you.
+    - adjust_margin() and set_auto_margin() are ISOLATED-position features
+      only. In CROSSED mode do NOT call them - they error or do nothing.
+    - In CROSSED mode the only fix for an "insufficient margin/balance" error
+      is to size the order down from availableBalance (get_balances()).
     """
 
     MARKET = "/future/market"
     USER = "/future/user"
     TRADE = "/future/trade"
+
+    # The XT create-profit endpoint REQUIRES expireTime (ms). A far-future
+    # value makes the TP/SL effectively permanent. Override per-call if needed.
+    TP_SL_DEFAULT_EXPIRY_MS = 4102444800000  # 2100-01-01 00:00 UTC
+
+    # "validate" (current docs) or "xt-validate" (older CCXT contract).
+    SIGN_PREFIX = os.getenv("XT_SIGN_PREFIX", "validate").strip("-").lower()
 
     def __init__(self, host: str, access_key: str, secret_key: str, timeout: int = 10):
         self.host = host.rstrip("/")
@@ -26,20 +58,12 @@ class XTClient:
         self.timeout = timeout
         self._session = requests.Session()
 
-    # ---------- signing (mirrors AItradekit MCP exactly) ----------
+    # ---------- signing ----------
 
     def _sign_headers(self, path: str, params: dict = None):
-        # Header/message prefix is "xt-validate-*", matching the working XT
-        # reference client (the xt-exchange plugin + AItradekit's xt_futures.py),
-        # which sign with these exact keys:
-        #   msg = "xt-validate-appkey={ak}&xt-validate-timestamp={ts}#{path}[#{sorted_params}]"
-        #   headers: xt-validate-appkey / xt-validate-timestamp /
-        #            xt-validate-signature / xt-validate-algorithms /
-        #            xt-validate-recvwindow
-        # Omitting the "xt-" prefix makes the server unable to match the key
-        # and every signed call is rejected, so the prefix must be kept.
+        p = self.SIGN_PREFIX
         ts = str(int(time.time() * 1000))
-        msg = f"xt-validate-appkey={self._ak}&xt-validate-timestamp={ts}"
+        msg = f"{p}-appkey={self._ak}&{p}-timestamp={ts}"
         if params:
             param_str = "&".join(f"{k}={params[k]}" for k in sorted(params))
             msg += f"#{path}#{param_str}"
@@ -48,11 +72,12 @@ class XTClient:
         sig = hmac.new(self._sk.encode(), msg.encode(), hashlib.sha256).hexdigest()
         return {
             "Content-type": "application/x-www-form-urlencoded",
-            "xt-validate-appkey": self._ak,
-            "xt-validate-timestamp": ts,
-            "xt-validate-signature": sig,
-            "xt-validate-algorithms": "HmacSHA256",
-            "xt-validate-recvwindow": "60000",
+            f"{p}-appkey": self._ak,
+            f"{p}-timestamp": ts,
+            f"{p}-signature": sig,
+            f"{p}-algorithms": "HmacSHA256",
+            # Docs recommend <= 5000ms; the default is 5000.
+            f"{p}-recvwindow": "5000",
         }
 
     # ---------- transport ----------
@@ -61,7 +86,18 @@ class XTClient:
         url = self.host + path
         params = {k: v for k, v in (params or {}).items() if v is not None}
 
-        max_retries = 5
+        # Order-placing endpoints are NOT idempotent: if the first attempt
+        # actually reached the exchange, blind-retrying after a timeout/5xx
+        # can place a duplicate order. Never auto-retry these.
+        no_retry = method == "POST" and (
+            path.endswith("/order/create")
+            or path.endswith("/order/create-batch")
+            or path.endswith("/entrust/create-profit")
+            or path.endswith("/entrust/create-plan")
+            or path.endswith("/entrust/create-track")
+        )
+
+        max_retries = 1 if no_retry else 5
         for attempt in range(max_retries):
             try:
                 if signed:
@@ -70,17 +106,29 @@ class XTClient:
                     headers = {"Content-type": "application/json"}
 
                 if method == "GET":
-                    resp = self._session.get(url, params=params, headers=headers, timeout=self.timeout)
+                    # GET: params go in the query string (signed the same way).
+                    resp = self._session.get(url, params=params, headers=headers,
+                                             timeout=self.timeout)
                 else:
-                    resp = self._session.post(url, params=params, headers=headers, timeout=self.timeout)
+                    # POST: params MUST go in the form-encoded BODY. The signed
+                    # param string above is identical to this body, so the
+                    # server-side hash matches.
+                    resp = self._session.post(url, data=params, headers=headers,
+                                              timeout=self.timeout)
 
                 if resp.status_code == 429:
+                    if no_retry:
+                        raise XTError(f"{path} -> HTTP 429 rate limited (not retried, "
+                                      f"order endpoint): {resp.text[:200]}")
                     retry_after = int(resp.headers.get("Retry-After", 2 ** attempt))
                     logger.warning(f"XT Rate Limit hit (429). Sleeping for {retry_after}s...")
                     time.sleep(retry_after)
                     continue
 
                 if 500 <= resp.status_code < 600:
+                    if no_retry:
+                        raise XTError(f"{path} -> HTTP {resp.status_code} (not retried, "
+                                      f"order endpoint): {resp.text[:200]}")
                     wait_time = 2 ** attempt
                     logger.warning(f"XT Server Error ({resp.status_code}). Retrying in {wait_time}s...")
                     time.sleep(wait_time)
@@ -89,6 +137,8 @@ class XTClient:
                 return self._unwrap(resp, path)
 
             except RequestException as e:
+                if no_retry:
+                    raise XTError(f"Network error on {path} (not retried, order endpoint): {e}")
                 wait_time = 2 ** attempt
                 logger.warning(f"Network error: {e}. Retrying in {wait_time}s...")
                 if attempt == max_retries - 1:
@@ -158,10 +208,13 @@ class XTClient:
     # ---------- account ----------
 
     def get_balances(self) -> list:
+        # In CROSSED mode size orders from "availableBalance" of the quote coin.
         data = self._private("GET", f"{self.USER}/v1/balance/list")
         return data if isinstance(data, list) else []
 
     def get_listen_key(self) -> str:
+        # Valid for 8 hours (server-side) - re-request before expiry if you use
+        # the user-data WebSocket stream.
         data = self._private("GET", f"{self.USER}/v1/user/listen-key")
         if isinstance(data, dict):
             return data.get("listenKey") or data.get("accessToken") or ""
@@ -170,26 +223,10 @@ class XTClient:
     # ---------- positions ----------
 
     def get_positions(self, symbol: str = None) -> list:
-        """Uses /future/user/v1/position ("Get active position information"),
-        NOT /future/user/v1/position/list ("Get Position Information").
-
-        Confirmed against the official xt-api docs: the /list endpoint's
-        response only has autoMargin, availableCloseSize, closeOrderSize,
-        entryPrice, isolatedMargin, leverage, openOrderMarginFrozen,
-        positionSide, positionSize, positionType, realizedProfit, symbol —
-        it has NO calMarkPrice, floatingPL, profitId, triggerProfitPrice, or
-        triggerStopPrice. Every one of those missing fields is exactly what
-        get_position_pnl(), ensure_tpsl(), check_tpsl_breakeven(), and
-        trail_stop_loss() read, which is why mark price / PnL / profitId
-        looked intermittently empty rather than a fetch bug: this endpoint
-        structurally never returns them. AItradekit's xt_futures.py and
-        xt-exchange-plugin's xt_futures.py both call /position/list too, so
-        this was inherited from them, not unique to this bot.
-        """
         params = {}
         if symbol:
             params["symbol"] = symbol
-        data = self._private("GET", f"{self.USER}/v1/position", params)
+        data = self._private("GET", f"{self.USER}/v1/position/list", params)
         return data if isinstance(data, list) else []
 
     def set_leverage(self, symbol: str, position_side: str, leverage: int):
@@ -198,17 +235,33 @@ class XTClient:
         })
 
     def set_position_type(self, symbol: str, position_side: str, position_type: str):
+        # XT API values are "CROSSED" and "ISOLATED" (NOT "CROSS"). "CROSS" is
+        # accepted and normalized so old callers keep working.
+        pt = str(position_type).upper()
+        if pt == "CROSS":
+            pt = "CROSSED"
+        if pt not in ("CROSSED", "ISOLATED"):
+            raise XTError(f"set_position_type: invalid positionType {position_type!r} "
+                          f"(expected CROSSED or ISOLATED)")
         return self._private("POST", f"{self.USER}/v1/position/change-type", {
-            "symbol": symbol, "positionSide": position_side, "positionType": position_type,
+            "symbol": symbol, "positionSide": position_side, "positionType": pt,
         })
 
     def adjust_margin(self, symbol: str, position_side: str, margin, direction: str):
+        # ISOLATED-only feature. In CROSSED mode you cannot add/reduce margin on
+        # a single position - do NOT call this when trading CROSSED.
+        direction = str(direction).upper()
+        if direction not in ("ADD", "SUB"):
+            raise XTError(f"adjust_margin: direction must be ADD or SUB, got {direction!r}")
         return self._private("POST", f"{self.USER}/v1/position/margin", {
             "symbol": symbol, "positionSide": position_side,
             "margin": margin, "type": direction,
         })
 
     def set_auto_margin(self, symbol: str, position_side: str, enabled: bool):
+        # ISOLATED-only feature. "Auto margin" does NOT exist in CROSSED mode
+        # (the whole available balance already backs the position) - do NOT
+        # call this when trading CROSSED; it errors or is a no-op.
         return self._private("POST", f"{self.USER}/v1/position/auto-margin", {
             "symbol": symbol, "positionSide": position_side, "autoMargin": bool(enabled),
         })
@@ -223,7 +276,8 @@ class XTClient:
 
     def create_order(self, symbol: str, position_side: str, order_side: str,
                      order_type: str, orig_qty: int, price=None,
-                     time_in_force: str = None, client_order_id: str = None):
+                     time_in_force: str = None, client_order_id: str = None,
+                     reduce_only: bool = None):
         params = {
             "symbol": symbol, "positionSide": position_side, "orderSide": order_side,
             "orderType": order_type, "origQty": int(orig_qty),
@@ -234,6 +288,10 @@ class XTClient:
             params["timeInForce"] = time_in_force
         if client_order_id is not None:
             params["clientOrderId"] = client_order_id
+        # In CROSSED + low margin, close/reduce with reduce_only=True so the
+        # order can never open a new position.
+        if reduce_only is not None:
+            params["reduceOnly"] = bool(reduce_only)
         return self._private("POST", f"{self.TRADE}/v1/order/create", params)
 
     def cancel_order(self, order_id):
@@ -255,10 +313,14 @@ class XTClient:
     # ---------- take profit / stop loss ----------
 
     def create_tpsl(self, symbol: str, position_side: str, orig_qty: int,
-                    trigger_profit_price, trigger_stop_price, expire_time_ms: int,
+                    trigger_profit_price, trigger_stop_price, expire_time_ms: int = None,
                     profit_order_type: str = "MARKET", stop_order_type: str = "MARKET",
                     profit_tif: str = "IOC", stop_tif: str = "IOC",
                     profit_price=None, stop_price=None):
+        # expireTime is REQUIRED by the XT API for this endpoint. When omitted
+        # it defaults to year 2100 -> effectively NO time limit.
+        if expire_time_ms is None:
+            expire_time_ms = self.TP_SL_DEFAULT_EXPIRY_MS
         params = {
             "symbol": symbol,
             "positionSide": position_side,
