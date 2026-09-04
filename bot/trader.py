@@ -81,8 +81,12 @@ class XTTrader:
         open_trades = self.memory.get_open_trades()
         if open_trades:
             report += "\n--- OPEN POSITIONS ---\n"
+            # Fetch all exchange positions once and reuse them per trade,
+            # instead of an N+1 pattern of one API call per open position.
+            positions_batch = self.position_mgr.get_positions_batch_optimized()
             for t in open_trades:
-                pos = self.position_mgr.get_position_pnl(t["symbol"], t["position_side"])
+                pos = self.position_mgr.get_position_pnl_optimized(
+                    t["symbol"], t["position_side"], positions_batch=positions_batch)
                 if not pos["exists"]:
                     report += (f"ID:{t['id']} {t['symbol']} {t['position_side']} "
                                f"NOT FOUND ON EXCHANGE (stale)\n")
@@ -377,7 +381,9 @@ class XTTrader:
                     entry_price = pos["entry_price"]
                 filled_qty = int(round(pos["position_size"]))
                 break
-            time.sleep(1.0)
+            # Non-blocking wait so a shutdown/stop signal interrupts the poll
+            # instead of a hard sleep holding the worker thread up to 3s.
+            self._stop_monitor.wait(1.0)
 
         if filled_qty <= 0:
             # A LIMIT order can rest unfilled. Leaving it open with no stop is
@@ -618,6 +624,12 @@ class XTTrader:
         last_scan = 0.0
         last_mid = 0.0
         last_report = 0.0
+        # Adoption fetches ALL exchange positions; run it at most every 5
+        # minutes instead of on every ~15s loop iteration. Untracked positions
+        # are still caught within one adoption window, and reconcile_open_trades
+        # (which keys off the local DB) still runs every cycle for safety.
+        adoption_interval = 300
+        last_adoption = 0.0
 
         while not self._stop_monitor.is_set():
             scan_interval = int(self.memory.get_setting("scan_interval_sec", 60))
@@ -626,12 +638,14 @@ class XTTrader:
             try:
                 # Adoption runs first: everything below keys off the local DB, so
                 # an untracked position would otherwise be invisible to the guard.
-                for event in self.position_mgr.adopt_exchange_positions():
-                    warn = "" if event["has_stop"] else " It has NO exchange stop loss."
-                    self._notify(f"Found untracked position on XT: {event['symbol']} "
-                                 f"{event['position_side']} {event['size']}c @ "
-                                 f"{event['entry_price']} {event['leverage']}x. "
-                                 f"Now managed as trade {event['trade_id']}.{warn}")
+                if now - last_adoption >= adoption_interval:
+                    last_adoption = now
+                    for event in self.position_mgr.adopt_exchange_positions():
+                        warn = "" if event["has_stop"] else " It has NO exchange stop loss."
+                        self._notify(f"Found untracked position on XT: {event['symbol']} "
+                                     f"{event['position_side']} {event['size']}c @ "
+                                     f"{event['entry_price']} {event['leverage']}x. "
+                                     f"Now managed as trade {event['trade_id']}.{warn}")
 
                 # Runs every guard_interval: cheap, and it is what protects capital.
                 for event in self.position_mgr.reconcile_open_trades():
