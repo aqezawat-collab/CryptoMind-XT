@@ -17,7 +17,7 @@ logger = logging.getLogger("xt_ai")
 # ---------------------------------------------------------------------------
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_MAX_COMPLETION_TOKENS = 16384
-REASONING_COMPLETION_MODELS = ("o1", "hy3-free", "big-pickle", "gpt-5")
+REASONING_COMPLETION_MODELS = ("gcli/grok-4.5-high", "hy3-free", "big-pickle", "gpt-5")
 
 SYSTEM_PROMPT = """You are an AI Trading Assistant for XT.com Futures.
 
