@@ -27,6 +27,14 @@ class XTTrader:
         self._auto_trade_enabled = False
         self._monitor_thread = None
         self._stop_monitor = threading.Event()
+        # Mid-management (breakeven, trailing stop, TP/SL protection) runs on
+        # its own always-on guardian thread so it fires by itself without a
+        # manual /midmanage and regardless of whether auto-trade is enabled.
+        # The lock serializes the guardian against the manual /midmanage path
+        # so two threads can never move the same stop concurrently.
+        self._mid_lock = threading.Lock()
+        self._mid_manager_thread = None
+        self._stop_mid_manager = threading.Event()
         self._notify_callback = None
 
     def set_notify_callback(self, callback):
@@ -497,7 +505,7 @@ class XTTrader:
         return "\n".join(self.close_specific_trade(t["id"]) for t in open_trades)
 
     def run_mid_management(self) -> str:
-        actions = self.position_mgr.mid_manage_positions()
+        actions = self._run_mid_cycle()
         if not actions:
             return "No mid-position management actions needed.\n\n" + self.diagnose()
         report = "MID-POSITION MANAGEMENT:\n"
@@ -595,6 +603,73 @@ class XTTrader:
                 self._notify(f"Failed to close {side} {symbol} on {reason}: {err}")
         return closed
 
+    # ---------- automatic mid-management ----------
+
+    MID_MANAGE_DEFAULT_INTERVAL_SEC = 120
+
+    def start_mid_manager(self) -> bool:
+        """Start the always-on mid-management guardian.
+
+        Periodically runs breakeven, trailing stop and TP/SL protection over
+        every open position so stops are managed automatically - no manual
+        /midmanage (or /autotrade_on) required. Safe to call repeatedly.
+        """
+        if self._mid_manager_thread and self._mid_manager_thread.is_alive():
+            return False
+        self._stop_mid_manager.clear()
+        self._mid_manager_thread = threading.Thread(
+            target=self._mid_manager_loop, daemon=True,
+            name="mid-manager-guardian")
+        self._mid_manager_thread.start()
+        logger.info("Automatic mid-management guardian started "
+                    "(breakeven + trailing + TP/SL protection)")
+        return True
+
+    def stop_mid_manager(self):
+        self._stop_mid_manager.set()
+        if self._mid_manager_thread and self._mid_manager_thread.is_alive():
+            self._mid_manager_thread.join(timeout=5)
+        logger.info("Automatic mid-management guardian stopped")
+
+    def _mid_manager_loop(self):
+        while not self._stop_mid_manager.is_set():
+            try:
+                for action in self._run_mid_cycle():
+                    self._notify_mid_action(action)
+            except Exception as e:
+                logger.error(f"Mid-management cycle error: {e}", exc_info=True)
+            interval = int(self.memory.get_setting(
+                "mid_manage_interval_sec", self.MID_MANAGE_DEFAULT_INTERVAL_SEC))
+            interval = max(30, min(interval, 3600))
+            self._stop_mid_manager.wait(interval)
+
+    def _run_mid_cycle(self) -> list:
+        """One mid-management pass over all open positions.
+
+        Serialized under _mid_lock so the guardian and a manual /midmanage
+        can never run the same exchange updates concurrently.
+        """
+        with self._mid_lock:
+            return self.position_mgr.mid_manage_positions()
+
+    def _notify_mid_action(self, action: dict):
+        """Push one mid-management action to Telegram/log so automatic fires
+        are visible instead of happening silently."""
+        label = {
+            "breakeven_activated": "BREAKEVEN",
+            "trailing_updated": "TRAILING STOP",
+            "tpsl_recovered": "TP/SL RE-ATTACHED",
+            "tpsl_missing": "TP/SL PROBLEM",
+            "position_adopted": "POSITION ADOPTED",
+        }.get(action["action"])
+        if not label:
+            return
+        if action["action"] == "position_adopted" and self._auto_trade_enabled:
+            # The auto-trade loop already announces adoptions; avoid a duplicate.
+            return
+        self._notify(f"{label} {action['symbol']} trade {action['trade_id']}: "
+                     f"{action['details']}")
+
     # ---------- auto trade loop ----------
 
     def start_auto_trade(self):
@@ -620,9 +695,7 @@ class XTTrader:
 
     def _auto_trade_loop(self):
         logger.info("Auto-trade monitoring loop started")
-        mid_manage_interval = 300
         last_scan = 0.0
-        last_mid = 0.0
         last_report = 0.0
         # Adoption fetches ALL exchange positions; run it at most every 5
         # minutes instead of on every ~15s loop iteration. Untracked positions
@@ -667,12 +740,9 @@ class XTTrader:
                     last_report = now
                     self._notify(self.periodic_pnl_report())
 
-                if now - last_mid >= mid_manage_interval:
-                    last_mid = now
-                    for action in self.position_mgr.mid_manage_positions():
-                        if action["action"] in ("tpsl_recovered", "tpsl_missing"):
-                            self._notify(f"{action['symbol']} trade "
-                                         f"{action['trade_id']}: {action['details']}")
+                # Mid-management (breakeven, trailing stop, TP/SL protection)
+                # runs on its own always-on guardian thread (start_mid_manager),
+                # independent of auto-trade and without a manual /midmanage.
             except Exception as e:
                 logger.error(f"Auto-trade loop error: {e}", exc_info=True)
             self._stop_monitor.wait(guard_interval)

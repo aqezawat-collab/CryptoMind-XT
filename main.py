@@ -132,6 +132,8 @@ def run_headless():
         logger.error(f"Position adoption failed at startup: {e}")
 
     trader.start_auto_trade()
+    # Breakeven/trailing/TP-SL protection runs regardless of auto-trade.
+    trader.start_mid_manager()
     logger.info("Headless auto-trade started. Send SIGINT (Ctrl+C) to stop.")
     try:
         while True:
@@ -139,6 +141,7 @@ def run_headless():
     except KeyboardInterrupt:
         logger.info("Shutting down via KeyboardInterrupt...")
     finally:
+        trader.stop_mid_manager()
         trader.stop_auto_trade()
         memory.close()
         logger.info("CryptoMind-XT stopped.")
@@ -236,6 +239,10 @@ def main():
         logger.error(f"Position adoption failed at startup: {e}")
 
     telegram_bot = TelegramBot(trader=trader, ai_chat=ai_chat, memory=memory)
+    # Start the always-on mid-management guardian (breakeven + trailing stop +
+    # TP/SL protection). It fires by itself - no /midmanage required - and the
+    # notify callback is already wired by TelegramBot above.
+    trader.start_mid_manager()
 
     logger.info("XT AI Trader started. Telegram bot is listening...")
     logger.info("Send /start to your bot to begin.")
@@ -247,6 +254,7 @@ def main():
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
     finally:
+        trader.stop_mid_manager()
         trader.stop_auto_trade()
         memory.close()
         logger.info("XT AI Trader stopped.")

@@ -358,6 +358,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("sync", self.cmd_sync))
         app.add_handler(CommandHandler("protect", self.cmd_protect))
         app.add_handler(CommandHandler("midmanage", self.cmd_midmanage))
+        app.add_handler(CommandHandler("mid", self.cmd_midmanage))  # alias of /midmanage
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         app.add_error_handler(self.error_handler)
 
