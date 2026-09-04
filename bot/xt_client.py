@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import logging
 import os
 import time
@@ -16,20 +17,21 @@ class XTError(Exception):
 class XTClient:
     """XT USDT-M futures REST client.
 
-    Signing rules (validated against the live API):
-    - Header keys carry a prefix. The CURRENT official docs (doc.xt.com) and
-      this bot's earlier live tests use "validate-*" (validate-appkey /
-      validate-timestamp / validate-signature). CCXT still sends the older
-      "xt-validate-*". The live server accepts the current documented prefix;
-      if a request ever fails with "invalid signature" and nothing else
-      changed, set the env var XT_SIGN_PREFIX=xt-validate to switch.
-    - Signed string = "<prefix>-appkey=..&<prefix>-timestamp=.." + "#path"
-      [+ "#sorted_params"] where sorted_params is exactly the payload the
-      server reconstructs: for GET the query string, for POST the
-      form-urlencoded BODY. Sending POST params in the query string while the
-      server hashes the (empty) body is the classic cause of
-      "invalid signature" - so POST params go in the body (data=), GET params
-      in the query string.
+    Signing follows the live-verified CCXT implementation for /future v1:
+    - Header keys are xt-validate-appkey / xt-validate-timestamp /
+      xt-validate-signature. XT's own auth errors name these exact headers
+      ("missing request header xt-validate-appkey", ...) and CCXT, the
+      battle-tested client, sends exactly this prefix. (The doc.xt.com pages
+      that show a "validate-*" prefix are misleading - the live server does
+      not see those headers and replies "invalid signature".)
+    - Signed string = "xt-validate-appkey=..&xt-validate-timestamp=.."
+      + "#path" [+ "#payload"] where payload is EXACTLY what the server
+      reconstructs: for POST the request BODY, for GET the query string.
+    - POST bodies are JSON (like CCXT); signing the exact same string that is
+      sent makes the server-side hash match. Set env XT_SIGN_BODY=form to send
+      form-urlencoded instead (signature is then over the sorted key=value
+      string). XT_SIGN_PREFIX can override the header prefix if XT ever
+      migrates it.
 
     CROSS (CROSSED) margin notes:
     - XT position type value is "CROSSED" (NOT "CROSS"); "ISOLATED" is the
@@ -48,8 +50,10 @@ class XTClient:
     # value makes the TP/SL effectively permanent. Override per-call if needed.
     TP_SL_DEFAULT_EXPIRY_MS = 4102444800000  # 2100-01-01 00:00 UTC
 
-    # "validate" (current docs) or "xt-validate" (older CCXT contract).
-    SIGN_PREFIX = os.getenv("XT_SIGN_PREFIX", "validate").strip("-").lower()
+    # Header prefix (server contract: "xt-validate"; override only if XT migrates).
+    SIGN_PREFIX = os.getenv("XT_SIGN_PREFIX", "xt-validate").strip("-").lower()
+    # POST body encoding: "json" (CCXT parity, default) or "form".
+    SIGN_BODY = os.getenv("XT_SIGN_BODY", "json").lower()
 
     def __init__(self, host: str, access_key: str, secret_key: str, timeout: int = 10):
         self.host = host.rstrip("/")
@@ -58,27 +62,55 @@ class XTClient:
         self.timeout = timeout
         self._session = requests.Session()
 
-    # ---------- signing ----------
+    # ---------- signing (CCXT parity for /future v1) ----------
 
-    def _sign_headers(self, path: str, params: dict = None):
+    def _signed_request_headers_and_payload(self, method: str, path: str, params: dict):
+        """Return (headers, send_kwargs) for a signed request.
+
+        The signed string is built over the exact payload that is sent, so the
+        server-side recomputation matches: JSON/form body for POST, query
+        string for GET.
+        """
         p = self.SIGN_PREFIX
         ts = str(int(time.time() * 1000))
         msg = f"{p}-appkey={self._ak}&{p}-timestamp={ts}"
-        if params:
-            param_str = "&".join(f"{k}={params[k]}" for k in sorted(params))
-            msg += f"#{path}#{param_str}"
+
+        if method == "GET":
+            if params:
+                param_str = "&".join(f"{k}={params[k]}" for k in sorted(params))
+                msg += f"#{path}#{param_str}"
+            else:
+                msg += f"#{path}"
+            sig = hmac.new(self._sk.encode(), msg.encode(), hashlib.sha256).hexdigest()
+            headers = {
+                "Content-type": "application/x-www-form-urlencoded",
+                f"{p}-appkey": self._ak,
+                f"{p}-timestamp": ts,
+                f"{p}-signature": sig,
+            }
+            return headers, {"params": params}
+
+        # POST: sign over the exact body string that is transmitted.
+        if self.SIGN_BODY == "form":
+            param_str = "&".join(f"{k}={params[k]}" for k in sorted(params)) if params else ""
+            body = param_str
+            headers = {
+                "Content-type": "application/x-www-form-urlencoded",
+            }
+        else:  # json (CCXT parity)
+            body = json.dumps(params, separators=(",", ":")) if params else ""
+            headers = {
+                "Content-type": "application/json",
+            }
+        if body:
+            msg += f"#{path}#{body}"
         else:
             msg += f"#{path}"
         sig = hmac.new(self._sk.encode(), msg.encode(), hashlib.sha256).hexdigest()
-        return {
-            "Content-type": "application/x-www-form-urlencoded",
-            f"{p}-appkey": self._ak,
-            f"{p}-timestamp": ts,
-            f"{p}-signature": sig,
-            f"{p}-algorithms": "HmacSHA256",
-            # Docs recommend <= 5000ms; the default is 5000.
-            f"{p}-recvwindow": "5000",
-        }
+        headers[f"{p}-appkey"] = self._ak
+        headers[f"{p}-timestamp"] = ts
+        headers[f"{p}-signature"] = sig
+        return headers, {"data": body}
 
     # ---------- transport ----------
 
@@ -86,9 +118,8 @@ class XTClient:
         url = self.host + path
         params = {k: v for k, v in (params or {}).items() if v is not None}
 
-        # Order-placing endpoints are NOT idempotent: if the first attempt
-        # actually reached the exchange, blind-retrying after a timeout/5xx
-        # can place a duplicate order. Never auto-retry these.
+        # Order-placing endpoints are NOT idempotent: blind-retrying after a
+        # timeout/5xx can place a duplicate order. Never auto-retry these.
         no_retry = method == "POST" and (
             path.endswith("/order/create")
             or path.endswith("/order/create-batch")
@@ -101,20 +132,18 @@ class XTClient:
         for attempt in range(max_retries):
             try:
                 if signed:
-                    headers = self._sign_headers(path, params)
+                    headers, send_kwargs = self._signed_request_headers_and_payload(
+                        method, path, params)
                 else:
                     headers = {"Content-type": "application/json"}
+                    send_kwargs = {"params": params} if method == "GET" else {"data": params}
 
                 if method == "GET":
-                    # GET: params go in the query string (signed the same way).
-                    resp = self._session.get(url, params=params, headers=headers,
-                                             timeout=self.timeout)
+                    resp = self._session.get(url, headers=headers, timeout=self.timeout,
+                                             **send_kwargs)
                 else:
-                    # POST: params MUST go in the form-encoded BODY. The signed
-                    # param string above is identical to this body, so the
-                    # server-side hash matches.
-                    resp = self._session.post(url, data=params, headers=headers,
-                                              timeout=self.timeout)
+                    resp = self._session.post(url, headers=headers, timeout=self.timeout,
+                                              **send_kwargs)
 
                 if resp.status_code == 429:
                     if no_retry:
