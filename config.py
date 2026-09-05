@@ -8,11 +8,28 @@ class Config:
     XT_API_KEY: str = os.getenv("XT_API_KEY", "")
     XT_API_SECRET: str = os.getenv("XT_API_SECRET", "")
 
+    # --- LLM Provider (OpenAI-compatible + Anthropic native, both custom) ---
+    # AI_PROVIDER: auto | openai | anthropic
+    #   auto = if ANTHROPIC_API_KEY is set and AI_API_KEY is empty -> anthropic, else openai-compatible
+    AI_PROVIDER: str = os.getenv("AI_PROVIDER", "auto").lower().strip()
     AI_API_KEY: str = os.getenv("AI_API_KEY", "")
     AI_BASE_URL: str = os.getenv("AI_BASE_URL", "https://api.openai.com/v1")
-    # When empty, the bot auto-detects a chat model from the provider's
-    # OpenAI-compatible /models endpoint (see bot/ai_chat.py).
+    # When empty, auto-detects a chat model from the provider's /models endpoint.
     AI_MODEL: str = os.getenv("AI_MODEL", "")
+
+    # Anthropic native API (custom base_url support as requested)
+    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+    ANTHROPIC_BASE_URL: str = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    ANTHROPIC_MODEL: str = os.getenv("ANTHROPIC_MODEL", "")
+
+    # Fallback chain: comma-separated models to try in order before auto-detection
+    # e.g. AI_FALLBACK_MODELS=gpt-4o-mini,claude-3-5-haiku,gemini-flash
+    AI_FALLBACK_MODELS: str = os.getenv("AI_FALLBACK_MODELS", "")
+
+    # Agent behavior
+    AGENT_MAX_STEPS: int = int(os.getenv("AGENT_MAX_STEPS", "8"))
+    AGENT_AUTONOMOUS_INTERVAL_SEC: int = int(os.getenv("AGENT_AUTONOMOUS_INTERVAL_SEC", "60"))
+    AGENT_DRY_RUN: str = os.getenv("AGENT_DRY_RUN", "false").lower()  # true = agent analyzes but does not open trades
 
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_USER_ID: str = os.getenv("TELEGRAM_USER_ID", "")
@@ -62,13 +79,40 @@ class Config:
     REPORT_INTERVAL_SEC: int = 300
 
     @classmethod
+    def get_effective_provider(cls) -> str:
+        """Return 'anthropic' or 'openai' based on AI_PROVIDER and keys."""
+        if cls.AI_PROVIDER == "anthropic":
+            return "anthropic"
+        if cls.AI_PROVIDER == "openai":
+            return "openai"
+        # auto
+        if cls.ANTHROPIC_API_KEY and not cls.AI_API_KEY:
+            return "anthropic"
+        return "openai"
+
+    @classmethod
+    def get_effective_api_key(cls) -> str:
+        return cls.ANTHROPIC_API_KEY if cls.get_effective_provider() == "anthropic" else cls.AI_API_KEY
+
+    @classmethod
+    def get_effective_base_url(cls) -> str:
+        return cls.ANTHROPIC_BASE_URL if cls.get_effective_provider() == "anthropic" else cls.AI_BASE_URL
+
+    @classmethod
+    def get_effective_model(cls) -> str:
+        return cls.ANTHROPIC_MODEL if cls.get_effective_provider() == "anthropic" else cls.AI_MODEL
+
+    @classmethod
     def validate(cls) -> list:
         missing = []
-        required = ["XT_API_KEY", "XT_API_SECRET", "AI_API_KEY",
-                    "TELEGRAM_BOT_TOKEN", "TELEGRAM_USER_ID"]
-        for key in required:
-            if not getattr(cls, key):
-                missing.append(key)
+        # XT creds can come from env OR ~/.xt-tradekit/credentials.json, so not strictly required here
+        # AI key: either AI_API_KEY or ANTHROPIC_API_KEY must be present
+        if not cls.AI_API_KEY and not cls.ANTHROPIC_API_KEY:
+            missing.append("AI_API_KEY or ANTHROPIC_API_KEY")
+        if not cls.TELEGRAM_BOT_TOKEN:
+            missing.append("TELEGRAM_BOT_TOKEN")
+        if not cls.TELEGRAM_USER_ID:
+            missing.append("TELEGRAM_USER_ID")
         if cls.TELEGRAM_USER_ID and not cls.TELEGRAM_USER_ID.strip().isdigit():
             missing.append("TELEGRAM_USER_ID (must be a numeric Telegram user id)")
         if cls.DEFAULT_LEVERAGE < 1 or cls.DEFAULT_LEVERAGE > 125:
@@ -118,6 +162,6 @@ class Config:
 
     @classmethod
     def to_dict(cls) -> dict:
-        redacted = {"XT_API_SECRET", "XT_API_KEY", "AI_API_KEY", "TELEGRAM_BOT_TOKEN"}
+        redacted = {"XT_API_SECRET", "XT_API_KEY", "AI_API_KEY", "ANTHROPIC_API_KEY", "TELEGRAM_BOT_TOKEN"}
         return {k: v for k, v in cls.__dict__.items()
                 if not k.startswith("_") and k.isupper() and k not in redacted}

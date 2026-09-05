@@ -68,6 +68,106 @@ def _resolve_xt_credentials():
     return "", ""
 
 
+def run_agent_headless():
+    """Run the AGENT in headless mode (no Telegram polling).
+    Agent decides autonomously every AGENT_AUTONOMOUS_INTERVAL_SEC.
+    """
+    logger.info("Starting CryptoMind-XT in AGENT HEADLESS mode.")
+    ak, sk = _resolve_xt_credentials()
+    if not ak or not sk:
+        logger.error("XT credentials not found. Set XT_API_KEY/XT_API_SECRET or "
+                     "place them in ~/.xt-tradekit/credentials.json.")
+        sys.exit(1)
+    Config.XT_API_KEY = ak
+    Config.XT_API_SECRET = sk
+
+    database_url = os.getenv("DATABASE_URL", "")
+    if not database_url:
+        database_url = "sqlite:///data/memory.db"
+        logger.warning("DATABASE_URL not set, using SQLite at data/memory.db (lost on deploy!)")
+    else:
+        logger.info(f"Database: {'MySQL' if 'mysql' in database_url else 'SQLite'}")
+
+    memory = LongTermMemory(database_url=database_url)
+    for k, v in Config.default_settings().items():
+        memory.set_setting_default(k, v)
+
+    trader = XTTrader(memory=memory)
+    trader.set_notify_callback(lambda m: logger.info(f"NOTIFY: {m}"))
+
+    # Init Agent Brain
+    from agent import Brain, Agent
+    try:
+        brain = Brain()
+        agent = Agent(trader=trader, memory=memory, brain=brain)
+        logger.info(f"Agent brain ready: {brain.get_model_info()}")
+    except Exception as e:
+        logger.error(f"Agent brain init failed: {e}", exc_info=True)
+        sys.exit(1)
+
+    try:
+        balances = trader.xt.get_balances()
+        usdt = next((b for b in balances if str(b.get("coin", "")).upper() == "USDT"), None)
+        if usdt:
+            logger.info(f"XT connection OK. USDT wallet: {usdt.get('walletBalance')}")
+        else:
+            logger.warning("XT connection OK but no USDT balance.")
+    except Exception as e:
+        logger.error(f"XT API check failed: {e}")
+
+    try:
+        adopted = trader.position_mgr.adopt_exchange_positions()
+        for a in adopted:
+            logger.warning(f"Adopted: {a['symbol']} {a['position_side']} {a['size']}c @ {a['entry_price']} {a['leverage']}x")
+        if not adopted:
+            logger.info("No untracked positions")
+    except Exception as e:
+        logger.error(f"Position adoption failed: {e}")
+
+    # Start safety guards (breakeven/trailing/reconcile) without old auto-trade
+    trader.start_mid_manager()
+    logger.info(f"Agent autonomous loop every {Config.AGENT_AUTONOMOUS_INTERVAL_SEC}s. Ctrl+C to stop.")
+
+    import threading
+    stop = threading.Event()
+
+    def agent_loop():
+        while not stop.is_set():
+            try:
+                # Safety: reconcile + guard first (as trader did)
+                for ev in trader.position_mgr.reconcile_open_trades():
+                    logger.info(f"Reconcile: {ev}")
+                trader.check_positions_for_close()
+                # Agent decision
+                interval = int(memory.get_setting("scan_interval_sec", Config.AGENT_AUTONOMOUS_INTERVAL_SEC))
+                # Use AGENT interval if set
+                try:
+                    interval = Config.AGENT_AUTONOMOUS_INTERVAL_SEC
+                except:
+                    pass
+                result = agent.autonomous_tick()
+                logger.info(f"AGENT TICK: {result[:500]}")
+                if "OPENED" in result or "CLOSED" in result:
+                    logger.info(f"AGENT ACTION: {result}")
+            except Exception as e:
+                logger.error(f"Agent tick error: {e}", exc_info=True)
+            stop.wait(Config.AGENT_AUTONOMOUS_INTERVAL_SEC)
+
+    t = threading.Thread(target=agent_loop, daemon=True)
+    t.start()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Shutting down agent...")
+    finally:
+        stop.set()
+        trader.stop_mid_manager()
+        memory.close()
+        logger.info("Agent stopped.")
+
+
 def run_headless():
     """Run the auto-trader without Telegram / AI / MySQL.
 
@@ -151,18 +251,21 @@ def main():
     if "--headless" in sys.argv:
         run_headless()
         return
-    # Telegram + AI are only needed for the interactive bot; importing them here
-    # (not at module top) keeps the headless path free of those heavy deps.
-    from bot.ai_chat import AIChat
-    from bot.telegram_bot import TelegramBot
+    if "--agent" in sys.argv or "--agent-headless" in sys.argv:
+        run_agent_headless()
+        return
+    # Telegram + AI are only needed for interactive; keep lazy import
+    # Try Agent first, fallback to old AIChat if brain fails
+    use_agent = True
     missing = Config.validate()
     if missing:
         logger.error(f"Missing required environment variables: {', '.join(missing)}")
         logger.error("Set them in Railway Variables or .env file.")
         sys.exit(1)
 
-    logger.info("Initializing XT AI Trader...")
-    logger.info(f"AI Model: {Config.AI_MODEL}")
+    logger.info("Initializing XT AI Trader (AGENT MODE)...")
+    logger.info(f"Provider: {Config.get_effective_provider()} @ {Config.get_effective_base_url()}")
+    logger.info(f"AI Model: {Config.get_effective_model() or 'auto'}")
     logger.info(f"Railway: {is_railway}")
     logger.info(f"PORT env: {os.getenv('PORT', '<unset>')}")
 
@@ -208,9 +311,44 @@ def main():
         logger.info("Existing settings preserved")
 
     trader = XTTrader(memory=memory)
-    ai_chat = AIChat(memory=memory)
-    ai_chat.bind_trader(trader)
-    logger.info(f"AI model: {ai_chat.get_model_info()}")
+
+    # --- AGENT MODE (replaces old bot) ---
+    agent = None
+    ai_chat = None
+    try:
+        from agent import Brain, Agent
+        brain = Brain()
+        agent = Agent(trader=trader, memory=memory, brain=brain)
+        logger.info(f"Agent brain ready: {brain.get_model_info()}")
+        # Start autonomous agent loop (replaces trader.start_auto_trade deterministice bot)
+        # Old bot loop deleted - agent decides itself
+        agent_loop_stop = None
+        def start_agent_autonomous():
+            import threading
+            stop = threading.Event()
+            def loop():
+                while not stop.is_set():
+                    try:
+                        for ev in trader.position_mgr.reconcile_open_trades():
+                            logger.info(f"Reconcile: {ev}")
+                        trader.check_positions_for_close()
+                        res = agent.autonomous_tick()
+                        logger.info(f"AGENT AUTONOMOUS: {res[:400]}")
+                    except Exception as e:
+                        logger.error(f"Agent tick error: {e}", exc_info=True)
+                    stop.wait(Config.AGENT_AUTONOMOUS_INTERVAL_SEC)
+            t = threading.Thread(target=loop, daemon=True)
+            t.start()
+            return stop
+        agent_loop_stop = start_agent_autonomous()
+        logger.info(f"Agent autonomous loop ON every {Config.AGENT_AUTONOMOUS_INTERVAL_SEC}s (AGENT MODE - bot deleted)")
+    except Exception as e:
+        logger.error(f"Agent init failed, falling back to old AIChat: {e}", exc_info=True)
+        from bot.ai_chat import AIChat
+        ai_chat = AIChat(memory=memory)
+        ai_chat.bind_trader(trader)
+        logger.info(f"AI model fallback: {ai_chat.get_model_info()}")
+        agent = None
 
     try:
         balances = trader.xt.get_balances()
@@ -238,11 +376,16 @@ def main():
     except Exception as e:
         logger.error(f"Position adoption failed at startup: {e}")
 
-    telegram_bot = TelegramBot(trader=trader, ai_chat=ai_chat, memory=memory)
-    # Start the always-on mid-management guardian (breakeven + trailing stop +
-    # TP/SL protection). It fires by itself - no /midmanage required - and the
-    # notify callback is already wired by TelegramBot above.
+    # Telegram now talks to AGENT, not old AIChat - keep mid_manager for safety
     trader.start_mid_manager()
+    if agent:
+        from agent.telegram_agent import TelegramAgent
+        telegram_bot = TelegramAgent(trader=trader, agent=agent, memory=memory)
+        logger.info("Telegram -> Agent mode")
+    else:
+        from bot.telegram_bot import TelegramBot
+        telegram_bot = TelegramBot(trader=trader, ai_chat=ai_chat, memory=memory)
+        logger.info("Telegram -> Legacy AIChat mode")
 
     logger.info("XT AI Trader started. Telegram bot is listening...")
     logger.info("Send /start to your bot to begin.")
@@ -254,8 +397,17 @@ def main():
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
     finally:
+        # Agent loop handles trading, old bot auto_trade not used anymore
+        try:
+            if 'agent_loop_stop' in locals() and agent_loop_stop:
+                agent_loop_stop.set()
+        except:
+            pass
         trader.stop_mid_manager()
-        trader.stop_auto_trade()
+        try:
+            trader.stop_auto_trade()
+        except:
+            pass
         memory.close()
         logger.info("XT AI Trader stopped.")
 
