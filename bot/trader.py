@@ -605,7 +605,12 @@ class XTTrader:
 
     # ---------- automatic mid-management ----------
 
-    MID_MANAGE_DEFAULT_INTERVAL_SEC = 120
+    # How often the guardian re-checks every open position for breakeven /
+    # trailing. This is a POLLING cadence, not a delay: as soon as ROI crosses
+    # the threshold the stop is moved on the very next check, so a smaller
+    # value reacts faster (trading on 1m/5m at high leverage wants seconds,
+    # not minutes). Floor of 15s matches the guard loop cadence.
+    MID_MANAGE_DEFAULT_INTERVAL_SEC = 30
 
     def start_mid_manager(self) -> bool:
         """Start the always-on mid-management guardian.
@@ -640,7 +645,7 @@ class XTTrader:
                 logger.error(f"Mid-management cycle error: {e}", exc_info=True)
             interval = int(self.memory.get_setting(
                 "mid_manage_interval_sec", self.MID_MANAGE_DEFAULT_INTERVAL_SEC))
-            interval = max(30, min(interval, 3600))
+            interval = max(15, min(interval, 3600))
             self._stop_mid_manager.wait(interval)
 
     def _run_mid_cycle(self) -> list:
