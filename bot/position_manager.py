@@ -368,26 +368,6 @@ class PositionManager:
                 return order
         return {}
 
-    def _get_profit_entrust(self, symbol: str, position_side: str, pos: dict) -> dict:
-        """Return the position's live TP/SL entrust WITH its real prices.
-
-        XT's position object frequently reports profitId as empty and
-        triggerProfitPrice/triggerStopPrice as 0 even when a profit entrust
-        exists - the real values live in the active entrust list. Breakeven
-        and trailing must read the entrust: updating a stop while passing
-        trigger_profit_price=0 makes XT reject the update, so the stop never
-        moves even when ROI is far past the threshold.
-        """
-        pid = pos.get("profit_id")
-        if pid and (pos.get("trigger_profit_price") or 0) > 0:
-            # The position object already carries usable prices - no extra call.
-            return {
-                "profitId": pid,
-                "triggerProfitPrice": pos.get("trigger_profit_price"),
-                "triggerStopPrice": pos.get("trigger_stop_price"),
-            }
-        return self.find_tpsl(symbol, position_side)
-
     def cancel_all_tpsl(self, symbol: str) -> bool:
         try:
             self.xt.cancel_all_tpsl(symbol)
@@ -432,20 +412,15 @@ class PositionManager:
                          f"ROI {pos['roi']:.2f}% < {threshold}%")
             return False
         entry = pos["entry_price"]
+        profit_id = self._get_profit_id(symbol, position_side, pos)
         if entry <= 0:
             return False
-        entrust = self._get_profit_entrust(symbol, position_side, pos)
-        profit_id = entrust.get("profitId")
         if not profit_id:
             logger.warning(f"Breakeven blocked for {symbol} {position_side}: "
                            f"no active TP/SL entrust found (position profitId "
                            f"empty and entrust list has none)")
             return False
-        # Read the REAL stop/take prices from the entrust: the position object
-        # reports 0 here, and passing trigger_profit_price=0 makes XT reject
-        # the update (the bug that silently blocked every breakeven move).
-        current_sl = float(entrust.get("triggerStopPrice") or 0)
-        current_tp = float(entrust.get("triggerProfitPrice") or 0)
+        current_sl = pos["trigger_stop_price"]
         # Only ever tighten. A manually placed stop that is already better than
         # breakeven must not be dragged back toward entry.
         #
@@ -469,8 +444,7 @@ class PositionManager:
                 return False
         logger.info(f"Breakeven {symbol} {position_side}: ROI={pos['roi']:.2f}% "
                     f"current_sl={current_sl} -> new_sl={new_sl} profit_id={profit_id}")
-        keep_tp = current_tp if current_tp > 0 else None
-        if self._move_stop(symbol, profit_id, new_sl, keep_tp):
+        if self._move_stop(symbol, profit_id, new_sl, pos["trigger_profit_price"]):
             logger.info(f"Breakeven: {symbol} {position_side} ROI {pos['roi']:.2f}% "
                         f"SL {current_sl} -> {new_sl}")
             return True
@@ -499,16 +473,13 @@ class PositionManager:
         if pos["roi"] < trigger_roi:
             return False, (f"ROI {pos['roi']:.2f}% below trailing trigger "
                            f"{trigger_roi}%"), None
-        entrust = self._get_profit_entrust(symbol, position_side, pos)
-        profit_id = entrust.get("profitId")
+        profit_id = self._get_profit_id(symbol, position_side, pos)
         if not profit_id:
             return False, "no active TP/SL entrust found (cannot move the stop)", None
         mark = pos["mark_price"]
         if mark <= 0:
             return False, "no mark price available", None
-        # Real entrust prices, not the position object's zeroed fields.
-        current_sl = float(entrust.get("triggerStopPrice") or 0)
-        current_tp = float(entrust.get("triggerProfitPrice") or 0)
+        current_sl = pos["trigger_stop_price"]
         if position_side == "LONG":
             new_sl = self.risk.round_price(symbol, mark * (1 - distance_pct / 100))
             improved = new_sl > current_sl
@@ -517,8 +488,7 @@ class PositionManager:
             improved = current_sl <= 0 or new_sl < current_sl
         if not improved:
             return False, f"no improvement (SL already {current_sl})", None
-        keep_tp = current_tp if current_tp > 0 else None
-        if self._move_stop(symbol, profit_id, new_sl, keep_tp):
+        if self._move_stop(symbol, profit_id, new_sl, pos["trigger_profit_price"]):
             logger.info(f"Trailing: {symbol} {position_side} ROI {pos['roi']:.2f}% "
                         f"SL {current_sl} -> {new_sl}")
             return True, f"Trailing SL {current_sl} -> {new_sl}", new_sl
@@ -533,16 +503,14 @@ class PositionManager:
         legacy = float(self.memory.get_setting("trailing_stop_pct", 2.0))
         trigger_roi = float(self.memory.get_setting("trailing_trigger_roi_pct", 0) or 0) or legacy
         distance_pct = float(self.memory.get_setting("trailing_distance_pct", 0) or 0) or legacy
-        entrust = self._get_profit_entrust(symbol, position_side, pos)
-        profit_id = entrust.get("profitId")
-        entrust_sl = float(entrust.get("triggerStopPrice") or 0)
-        entrust_tp = float(entrust.get("triggerProfitPrice") or 0)
+        profit_id = self._get_profit_id(symbol, position_side, pos)
         lines = [
             f"{symbol} {position_side}",
             f"  entry={pos['entry_price']} mark={pos['mark_price']} "
             f"lev={pos['leverage']}x size={int(pos['position_size'])}c",
             f"  ROI on margin = {pos['roi']:.2f}%",
-            f"  exchange SL={entrust_sl} TP={entrust_tp} profitId={profit_id}",
+            f"  exchange SL={pos['trigger_stop_price']} TP={pos['trigger_profit_price']} "
+            f"profitId={profit_id}",
             f"  breakeven fires at ROI >= {be_threshold}% -> "
             f"{'READY' if pos['roi'] >= be_threshold else 'not yet'}",
             f"  trailing fires at ROI >= {trigger_roi}% (distance {distance_pct}% of price) -> "
