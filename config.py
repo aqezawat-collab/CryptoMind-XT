@@ -40,10 +40,15 @@ class Config:
     GUARD_INTERVAL_SEC: int = 15
     MAX_LOSS_PCT: float = 40.0
     MAX_PROFIT_PCT: float = 500.0
-    BREAKEVEN_THRESHOLD_PCT: float = 8.0
+    # ROI-on-margin thresholds for stop management. These are the values that
+    # get seeded whenever a setting is missing from the DB (e.g. after a wipe),
+    # so they are the owner's intended defaults - NOT the tiny 8%/15% that
+    # yanked stops at noise level on 50x leverage. At 50x, 30% ROI is a 0.6%
+    # price move and 45% is ~0.9%: real profit, not market noise.
+    BREAKEVEN_THRESHOLD_PCT: float = 30.0
     TRAILING_STOP_PCT: float = 15.0
 
-    TRAILING_TRIGGER_ROI_PCT: float = 15.0
+    TRAILING_TRIGGER_ROI_PCT: float = 45.0
     TRAILING_DISTANCE_PCT: float = 0.5
 
     SL_LIQUIDATION_SAFETY: float = 0.5
