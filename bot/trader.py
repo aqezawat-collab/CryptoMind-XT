@@ -70,6 +70,14 @@ class XTTrader:
         report += (f"Trades: {stats['total']} total | {stats['open']} open | "
                    f"{stats['closed']} closed | {stats['winrate']}% WR\n")
         report += f"Auto-Trade: {'ON' if self._auto_trade_enabled else 'OFF'}\n"
+        mid_on = bool(self._mid_manager_thread and self._mid_manager_thread.is_alive())
+        if mid_on:
+            mid_interval = int(self.memory.get_setting(
+                "mid_manage_interval_sec", self.MID_MANAGE_DEFAULT_INTERVAL_SEC))
+            report += (f"Mid-Management: ON (checking every "
+                       f"{max(15, min(mid_interval, 3600))}s)\n")
+        else:
+            report += "Mid-Management: OFF\n"
         report += f"Cooldowns: {self._get_cooldown_status(symbol)}\n\n"
 
         report += "--- SETTINGS ---\n"
