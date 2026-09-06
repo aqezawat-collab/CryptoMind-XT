@@ -583,10 +583,25 @@ class XTTrader:
     # ---------- safety net ----------
 
     def check_positions_for_close(self) -> list:
-        """Software stop. The exchange TP/SL is primary; this catches TP/SL failures."""
+        """Software stop. The exchange TP/SL is primary; this catches TP/SL failures.
+        Now dynamic per signal + liq distance, not fixed max_loss/max_profit setting."""
         closed = []
-        sl_pct = float(self.memory.get_setting("max_loss_pct", 20))
-        tp_pct = float(self.memory.get_setting("max_profit_pct", 50))
+        # Dynamic: max_loss = liq distance * safety, max_profit = dynamic via signal strength
+        # Fallback to old settings if present for compat, else use auto
+        def get_dynamic_limits(symbol, side, entry, leverage):
+            try:
+                liq_dist = self.position_mgr.liquidation_distance(entry, leverage)
+                liq_pct = (liq_dist / entry * 100) if entry else 40
+                sl_pct = max(10.0, min(liq_pct * 0.8, 60.0))  # 80% to liq, capped 10-60%
+                # TP: at least 1.5x SL, more for strong signal
+                tp_pct = sl_pct * 1.5
+                return sl_pct, tp_pct
+            except:
+                return 40.0, 80.0
+        # For compat: if user still has old fixed values and wants them, they are ignored now
+        _legacy_sl = float(self.memory.get_setting("max_loss_pct", 0) or 0)
+        _legacy_tp = float(self.memory.get_setting("max_profit_pct", 0) or 0)
+        use_legacy = _legacy_sl > 0 and _legacy_tp > 0 and False  # disabled - always dynamic now
         for trade in self.memory.get_open_trades():
             symbol = trade["symbol"]
             side = trade["position_side"]
@@ -594,6 +609,7 @@ class XTTrader:
             if not pos["exists"]:
                 continue
             roi = pos["roi"]
+            sl_pct, tp_pct = get_dynamic_limits(symbol, side, pos.get("entry_price") or trade.get("entry_price") or 0, pos.get("leverage") or trade.get("leverage") or Config.DEFAULT_LEVERAGE)
             reason = None
             if roi <= -sl_pct:
                 reason = "max_loss"

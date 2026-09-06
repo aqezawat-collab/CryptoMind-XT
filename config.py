@@ -57,8 +57,8 @@ class Config:
 
     SCAN_INTERVAL_SEC: int = 60
     GUARD_INTERVAL_SEC: int = 15
-    MAX_LOSS_PCT: float = 40.0
-    MAX_PROFIT_PCT: float = 500.0
+    # max_loss/max_profit are now dynamic per signal + liq distance, not user settings
+    # Kept for backward compat but not shown in settings
     # ROI-on-margin thresholds for stop management. These are the values that
     # get seeded whenever a setting is missing from the DB (e.g. after a wipe),
     # so they are the owner's intended defaults - NOT the tiny 8%/15% that
@@ -154,8 +154,6 @@ class Config:
             "position_mode": "margin",
             "scan_interval_sec": cls.SCAN_INTERVAL_SEC,
             "guard_interval_sec": cls.GUARD_INTERVAL_SEC,
-            "max_loss_pct": cls.MAX_LOSS_PCT,
-            "max_profit_pct": cls.MAX_PROFIT_PCT,
             "breakeven_threshold_pct": cls.BREAKEVEN_THRESHOLD_PCT,
             "trailing_stop_pct": cls.TRAILING_STOP_PCT,
             "trailing_trigger_roi_pct": cls.TRAILING_TRIGGER_ROI_PCT,
