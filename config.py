@@ -52,6 +52,8 @@ class Config:
     MIN_CONFIDENCE: int = 80
 
     TF_MIN_CONFIDENCE: int = 60
+    MIN_AGREEING_STRATEGIES: int = 2
+    SIGNAL_CONFIRM_SCANS: int = 1
 
     SCAN_INTERVAL_SEC: int = 60
     GUARD_INTERVAL_SEC: int = 15
@@ -145,6 +147,8 @@ class Config:
             "margin_risk_pct": cls.DEFAULT_RISK_PCT,
             "min_confidence": cls.MIN_CONFIDENCE,
             "tf_min_confidence": cls.TF_MIN_CONFIDENCE,
+            "min_agreeing_strategies": cls.MIN_AGREEING_STRATEGIES,
+            "signal_confirm_scans": cls.SIGNAL_CONFIRM_SCANS,
             "cooldown_minutes": cls.SIGNAL_COOLDOWN_MINUTES,
             "max_positions": cls.MAX_POSITIONS,
             "position_mode": "margin",

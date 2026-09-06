@@ -103,6 +103,14 @@ TOOLS = [
             "value": {"type": "string", "description": "Memory value"}
         }, "required": ["key", "value"]}
     },
+    {
+        "name": "set_setting",
+        "description": "Change a trading setting (min_agreeing_strategies, report_interval_sec, timeframes, etc). Use to tune strategy.",
+        "parameters": {"type": "object", "properties": {
+            "key": {"type": "string", "description": "Setting key: min_agreeing_strategies, report_interval_sec, timeframes, min_confidence, tf_min_confidence, leverage, margin_amount_pct, etc"},
+            "value": {"type": "string", "description": "New value (e.g. '2' for min_agreeing_strategies, '120' for report_interval_sec, '1m,5m,15m,4h' for timeframes)"}
+        }, "required": ["key", "value"]}
+    },
 ]
 
 
@@ -129,6 +137,7 @@ class AgentTools:
             "manage_position": self._manage_position,
             "do_not_trade": self._do_not_trade,
             "remember": self._remember,
+            "set_setting": self._set_setting,
         }
         h = handlers.get(name)
         if not h:
@@ -264,3 +273,28 @@ class AgentTools:
     def _remember(self, args: Dict) -> str:
         self.memory.set_ai_context(args["key"], args["value"])
         return f"Remembered {args['key']}: {args['value']}"
+
+    def _set_setting(self, args: Dict) -> str:
+        key = args.get("key", "").strip()
+        value = args.get("value", "").strip()
+        if not key:
+            return "Missing key"
+        # Validate and set known settings
+        try:
+            if key in ("min_agreeing_strategies", "signal_confirm_scans", "tf_min_confidence", "min_confidence", "leverage", "max_positions", "cooldown_minutes", "scan_interval_sec", "guard_interval_sec", "report_interval_sec", "reversal_confidence"):
+                self.memory.set_setting(key, int(float(value)))
+                return f"Setting {key} set to {value} (int)"
+            elif key in ("margin_amount_pct", "margin_risk_pct", "max_loss_pct", "max_profit_pct", "breakeven_threshold_pct", "trailing_stop_pct", "trailing_trigger_roi_pct", "trailing_distance_pct", "sl_liquidation_safety"):
+                self.memory.set_setting(key, float(value))
+                return f"Setting {key} set to {value} (float)"
+            elif key in ("timeframes", "symbol", "margin_mode", "position_mode", "on_tpsl_failure"):
+                self.memory.set_setting(key, value)
+                return f"Setting {key} set to {value}"
+            elif key in ("reversal_enabled",):
+                self.memory.set_setting(key, value.lower() in ("1", "true", "yes", "on"))
+                return f"Setting {key} set to {value}"
+            else:
+                self.memory.set_setting(key, value)
+                return f"Setting {key} set to {value} (generic)"
+        except Exception as e:
+            return f"Failed to set {key}: {e}"
