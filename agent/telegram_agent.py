@@ -69,7 +69,9 @@ class TelegramAgent:
             return
         loop = asyncio.get_event_loop()
         report = await loop.run_in_executor(None, self.trader.get_status_report)
-        report = f"🧠 Agent: {self.agent.get_model_info()}\n\n" + report
+        # Fix legacy bot display: Agent is always ON, old Auto-Trade flag is irrelevant
+        report = report.replace("Auto-Trade: OFF", "Agent: ON (autonomous every 60s)").replace("Auto-Trade: ON", "Agent: ON (autonomous every 60s)")
+        report = f"🧠 Agent: {self.agent.get_model_info()} | AGENT MODE - always ON after deploy\n\n" + report
         for c in _split(report):
             await update.message.reply_text(c)
 
