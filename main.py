@@ -130,25 +130,29 @@ def run_agent_headless():
 
     import threading
     stop = threading.Event()
+    last_report_hd = 0.0
 
     def agent_loop():
+        nonlocal last_report_hd
         while not stop.is_set():
             try:
-                # Safety: reconcile + guard first (as trader did)
                 for ev in trader.position_mgr.reconcile_open_trades():
                     logger.info(f"Reconcile: {ev}")
                 trader.check_positions_for_close()
-                # Agent decision
-                interval = int(memory.get_setting("scan_interval_sec", Config.AGENT_AUTONOMOUS_INTERVAL_SEC))
-                # Use AGENT interval if set
-                try:
-                    interval = Config.AGENT_AUTONOMOUS_INTERVAL_SEC
-                except:
-                    pass
                 result = agent.autonomous_tick()
                 logger.info(f"AGENT TICK: {result[:500]}")
                 if "OPENED" in result or "CLOSED" in result:
                     logger.info(f"AGENT ACTION: {result}")
+                # Periodic report for headless too
+                try:
+                    interval = int(memory.get_setting("report_interval_sec", Config.REPORT_INTERVAL_SEC))
+                    now = time.time()
+                    if interval > 0 and now - last_report_hd >= interval:
+                        last_report_hd = now
+                        report = trader.periodic_pnl_report()
+                        logger.info(f"PERIODIC REPORT: {report[:500]}")
+                except Exception as e:
+                    logger.warning(f"Periodic report failed: {e}")
             except Exception as e:
                 logger.error(f"Agent tick error: {e}", exc_info=True)
             stop.wait(Config.AGENT_AUTONOMOUS_INTERVAL_SEC)
@@ -326,14 +330,28 @@ def main():
         def start_agent_autonomous():
             import threading
             stop = threading.Event()
+            last_report = 0.0
             def loop():
+                nonlocal last_report
                 while not stop.is_set():
                     try:
                         for ev in trader.position_mgr.reconcile_open_trades():
                             logger.info(f"Reconcile: {ev}")
                         trader.check_positions_for_close()
                         res = agent.autonomous_tick()
-                        logger.info(f"AGENT AUTONOMOUS: {res[:400]}")
+                        logger.info(f"AGENT AUTONOMOUS: {res[:500]}")
+                        # Periodic status report (report_interval_sec) - so user gets status every 60s even without trade
+                        try:
+                            interval = int(memory.get_setting("report_interval_sec", Config.REPORT_INTERVAL_SEC))
+                            now = time.time()
+                            if interval > 0 and now - last_report >= interval:
+                                last_report = now
+                                report = trader.periodic_pnl_report()
+                                # Send to Telegram via notify and log
+                                trader._notify(report)
+                                logger.info(f"PERIODIC REPORT: {report[:400]}")
+                        except Exception as e:
+                            logger.warning(f"Periodic report failed: {e}")
                     except Exception as e:
                         logger.error(f"Agent tick error: {e}", exc_info=True)
                     stop.wait(Config.AGENT_AUTONOMOUS_INTERVAL_SEC)
@@ -341,7 +359,7 @@ def main():
             t.start()
             return stop
         agent_loop_stop = start_agent_autonomous()
-        logger.info(f"Agent autonomous loop ON every {Config.AGENT_AUTONOMOUS_INTERVAL_SEC}s (AGENT MODE - bot deleted)")
+        logger.info(f"Agent autonomous loop ON every {Config.AGENT_AUTONOMOUS_INTERVAL_SEC}s, report every {memory.get_setting('report_interval_sec', Config.REPORT_INTERVAL_SEC)}s (AGENT MODE - bot deleted)")
     except Exception as e:
         logger.error(f"Agent init failed, falling back to old AIChat: {e}", exc_info=True)
         from bot.ai_chat import AIChat
