@@ -218,8 +218,11 @@ class Brain:
             or "not enough" in low
             or "payment required" in low
             or "exceeded your current quota" in low
-            or "rate_limit" in low and "credit" in low
             or "billing" in low
+            or "freeusagelimit" in low
+            or "free_usage" in low
+            or "rate_limit_exceeded" in low
+            or "429" in err_str and "rate_limit" in low
         )
 
     def _next_candidate(self) -> str:
