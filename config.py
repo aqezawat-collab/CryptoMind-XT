@@ -165,6 +165,9 @@ class Config:
             "report_interval_sec": cls.REPORT_INTERVAL_SEC,
         }
 
+    # Keys that are legacy (removed from default_settings) and should be auto-deleted from DB
+    LEGACY_SETTINGS = {"max_loss_pct", "max_profit_pct"}
+
     @classmethod
     def to_dict(cls) -> dict:
         redacted = {"XT_API_SECRET", "XT_API_KEY", "AI_API_KEY", "ANTHROPIC_API_KEY", "TELEGRAM_BOT_TOKEN"}

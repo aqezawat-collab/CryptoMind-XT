@@ -313,6 +313,16 @@ def main():
         logger.info(f"Seeded default settings: {', '.join(sorted(seeded))}")
     else:
         logger.info("Existing settings preserved")
+    # Auto-delete legacy settings (max_loss/max_profit now dynamic, not in settings)
+    try:
+        from sqlalchemy import text as sql_text
+        # Use memory's engine to delete legacy keys
+        with memory._engine.begin() as conn:
+            for legacy_key in getattr(Config, "LEGACY_SETTINGS", set()):
+                conn.execute(sql_text("DELETE FROM settings WHERE `key`=:k"), {"k": legacy_key})
+        logger.info("Legacy settings cleaned (max_loss/max_profit removed from DB)")
+    except Exception as e:
+        logger.warning(f"Legacy cleanup failed (ignore if first run): {e}")
 
     trader = XTTrader(memory=memory)
 
