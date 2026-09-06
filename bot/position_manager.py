@@ -99,9 +99,10 @@ class PositionManager:
             mark = self._public_mark_price(symbol)
         size = float(pos.get("positionSize") or 0)
         leverage = int(float(pos.get("leverage") or 1))
-        pnl = float(pos.get("floatingPL") or 0)
+        # floatingPL is often 0/missing on XT for some symbols (e.g. uai_usdt) - calculate from price diff
+        raw_pnl = float(pos.get("floatingPL") or pos.get("unrealizedProfit") or pos.get("profit") or 0)
         margin = float(pos.get("isolatedMargin") or 0)
-        cs = self.risk.get_contract_size(symbol)
+        cs = self.risk.get_contract_size(symbol) or 1.0
         # ROI on margin: price move as a fraction of entry, amplified by leverage.
         roi = 0.0
         if entry > 0 and mark > 0:
@@ -109,6 +110,12 @@ class PositionManager:
             if position_side == "SHORT":
                 move = -move
             roi = move * leverage * 100
+        # Fallback PnL calc if exchange returns 0 but ROI is clearly non-zero (bug for uai_usdt)
+        pnl = raw_pnl
+        if abs(pnl) < 1e-9 and abs(roi) > 0.1 and size > 0 and cs > 0:
+            # PnL = price_diff * size * contractSize
+            price_diff = (mark - entry) if position_side == "LONG" else (entry - mark)
+            pnl = price_diff * size * cs
         return {
             "exists": True,
             "unrealized_pnl": pnl,
@@ -173,15 +180,19 @@ class PositionManager:
             mark = self._public_mark_price(symbol)
         size = float(pos.get("positionSize") or 0)
         leverage = int(float(pos.get("leverage") or 1))
-        pnl = float(pos.get("floatingPL") or 0)
+        raw_pnl = float(pos.get("floatingPL") or pos.get("unrealizedProfit") or pos.get("profit") or 0)
         margin = float(pos.get("isolatedMargin") or 0)
-        cs = self.risk.get_contract_size(symbol)
+        cs = self.risk.get_contract_size(symbol) or 1.0
         roi = 0.0
         if entry > 0 and mark > 0:
             move = (mark - entry) / entry
             if position_side == "SHORT":
                 move = -move
             roi = move * leverage * 100
+        pnl = raw_pnl
+        if abs(pnl) < 1e-9 and abs(roi) > 0.1 and size > 0 and cs > 0:
+            price_diff = (mark - entry) if position_side == "LONG" else (entry - mark)
+            pnl = price_diff * size * cs
         return {
             "exists": True,
             "unrealized_pnl": pnl,

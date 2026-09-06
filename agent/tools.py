@@ -111,6 +111,14 @@ TOOLS = [
             "value": {"type": "string", "description": "New value (e.g. '2' for min_agreeing_strategies, '120' for report_interval_sec, '1m,5m,15m,4h' for timeframes)"}
         }, "required": ["key", "value"]}
     },
+    {
+        "name": "reset_cooldown",
+        "description": "Reset cooldown for a symbol/side so you can trade immediately. Use when cooldown blocks a valid entry.",
+        "parameters": {"type": "object", "properties": {
+            "symbol": {"type": "string", "description": "e.g. uai_usdt, defaults to current symbol"},
+            "side": {"type": "string", "description": "LONG, SHORT, or ALL", "enum": ["LONG", "SHORT", "ALL"]}
+        }}
+    },
 ]
 
 
@@ -138,6 +146,7 @@ class AgentTools:
             "do_not_trade": self._do_not_trade,
             "remember": self._remember,
             "set_setting": self._set_setting,
+            "reset_cooldown": self._reset_cooldown,
         }
         h = handlers.get(name)
         if not h:
@@ -269,6 +278,28 @@ class AgentTools:
         reason = args.get("reason", "No reason")
         self.memory.add_chat_message("assistant", f"Decision: DO NOT TRADE - {reason}")
         return f"Decision recorded: DO NOT TRADE - {reason}"
+
+    def _reset_cooldown(self, args: Dict) -> str:
+        symbol = (args.get("symbol") or self.memory.get_setting("symbol", self.Config.DEFAULT_SYMBOL)).lower()
+        side = (args.get("side") or "ALL").upper()
+        try:
+            from sqlalchemy import text as sql_text
+            with self.memory._engine.begin() as conn:
+                if side == "ALL":
+                    conn.execute(sql_text("DELETE FROM cooldowns WHERE symbol=:s"), {"s": symbol})
+                    # also delete generic
+                    conn.execute(sql_text("DELETE FROM cooldowns WHERE symbol=:s"), {"s": symbol})
+                else:
+                    conn.execute(sql_text("DELETE FROM cooldowns WHERE symbol=:s AND side=:side"), {"s": symbol, "side": side})
+            return f"Cooldown reset for {symbol} {side} - you can trade now"
+        except Exception as e:
+            # fallback: set to 0
+            try:
+                self.memory.set_cooldown(symbol, "LONG", 0)
+                self.memory.set_cooldown(symbol, "SHORT", 0)
+                return f"Cooldown reset via fallback for {symbol}: {e}"
+            except Exception as e2:
+                return f"Reset failed: {e2}"
 
     def _remember(self, args: Dict) -> str:
         self.memory.set_ai_context(args["key"], args["value"])
