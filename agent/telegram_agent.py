@@ -55,6 +55,7 @@ class TelegramAgent:
             "/status - Agent + positions\n"
             "/balance - Wallet\n"
             "/pnl - PnL report\n"
+            "/signal - Scan signals (with RSI veto)\n"
             "/agent - Force agent autonomous tick now\n"
             "/close [id] - Close position\n"
             "/settings - View settings\n"
@@ -134,6 +135,17 @@ class TelegramAgent:
         for c in _split(res):
             await update.message.reply_text(c)
 
+    async def cmd_signal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_auth(update.effective_user.id):
+            await update.message.reply_text("Unauthorized.")
+            return
+        await update.message.reply_text("Scanning signals...")
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, self.trader.scanner.scan_and_report)
+        report = self.trader.scanner.format_signal_report(result)
+        for c in _split(report):
+            await update.message.reply_text(c)
+
     async def cmd_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         s = self.memory.get_all_settings()
         await update.message.reply_text("\n".join(f"{k}: {v}" for k,v in s.items()) or "No settings")
@@ -165,6 +177,7 @@ class TelegramAgent:
         app.add_handler(CommandHandler("status", self.cmd_status))
         app.add_handler(CommandHandler("balance", self.cmd_balance))
         app.add_handler(CommandHandler("pnl", self.cmd_pnl))
+        app.add_handler(CommandHandler("signal", self.cmd_signal))
         app.add_handler(CommandHandler("agent", self.cmd_agent))
         app.add_handler(CommandHandler("check_ai", self.cmd_check_ai))
         app.add_handler(CommandHandler("close", self.cmd_close))
@@ -184,6 +197,7 @@ class TelegramAgent:
             BotCommand("status", "Status + positions"),
             BotCommand("balance", "Balance"),
             BotCommand("pnl", "PnL"),
+            BotCommand("signal", "Scan signals"),
             BotCommand("agent", "Force agent tick"),
             BotCommand("check_ai", "Test brain"),
             BotCommand("close", "Close position"),

@@ -210,6 +210,19 @@ class StrategyEngine:
         long_signals = [r for r in results if r["direction"] == "LONG" and r["confidence"] >= min_confidence]
         short_signals = [r for r in results if r["direction"] == "SHORT" and r["confidence"] >= min_confidence]
 
+        # RSI veto: if RSI is overbought (>70) don't LONG, if oversold (<30) don't SHORT
+        # RSI is the first filter - even if 4 strategies agree LONG but RSI says overbought, veto
+        rsi_entry = next((r for r in results if r["strategy"] == "RSI"), None)
+        rsi_val = None
+        if rsi_entry and rsi_entry.get("details", {}).get("rsi") is not None:
+            rsi_val = float(rsi_entry["details"]["rsi"])
+            if rsi_val >= 70:
+                # Overbought - veto LONG
+                long_signals = []
+            if rsi_val <= 30:
+                # Oversold - veto SHORT
+                short_signals = []
+
         direction = "NEUTRAL"
         signal_strength = 0.0
         strategies_used = []
@@ -237,6 +250,17 @@ class StrategyEngine:
             # becomes SHORT 75%, not an unopposed SHORT 85%.
             avg_confidence = int(sum(r["confidence"] for r in all_signals) / len(all_signals))
 
+        # If vetoed, mark as NEUTRAL with veto reason
+        veto_reason = None
+        if rsi_val is not None:
+            if rsi_val >= 70 and direction == "LONG":
+                # Should not happen due to veto above, but keep as safety
+                veto_reason = f"RSI {rsi_val:.1f} overbought - LONG vetoed"
+                direction = "NEUTRAL"
+            elif rsi_val <= 30 and direction == "SHORT":
+                veto_reason = f"RSI {rsi_val:.1f} oversold - SHORT vetoed"
+                direction = "NEUTRAL"
+
         return {
             "direction": direction,
             "confidence": avg_confidence if avg_confidence else 0,
@@ -245,4 +269,6 @@ class StrategyEngine:
             "all_signals": results,
             "long_count": len(long_signals),
             "short_count": len(short_signals),
+            "rsi": rsi_val,
+            "veto_reason": veto_reason,
         }
