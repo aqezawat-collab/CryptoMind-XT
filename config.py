@@ -41,10 +41,9 @@ class Config:
     DEFAULT_SYMBOL: str = "btc_usdt"
     DEFAULT_LEVERAGE: int = 40
     DEFAULT_MARGIN_MODE: str = "CROSSED"
-    # 1m-15m catch short-term moves; 1h/4h give the higher-timeframe trend
-    # context the scanner was previously blind to (a strong 1h/4h uptrend read
-    # as "no signal" when only the micro pullback on short TFs was visible).
-    DEFAULT_TIMEFRAMES: list = ["1m", "3m", "5m", "15m", "1h", "4h"]
+    # Timeframes tuned with user: 1m,3m for micro entry, 15m for main trend
+    # 4h/1h removed (dominated weight 59% and hid micro pullbacks), now 15m is dominant 53% weight
+    DEFAULT_TIMEFRAMES: list = ["1m", "3m", "15m"]
     DEFAULT_MARGIN_AMOUNT_PCT: float = 25.0
     DEFAULT_RISK_PCT: float = 1.0
     SIGNAL_COOLDOWN_MINUTES: int = 5
