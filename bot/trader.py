@@ -609,12 +609,11 @@ class XTTrader:
             if not pos["exists"]:
                 continue
             roi = pos["roi"]
-            sl_pct, tp_pct = get_dynamic_limits(symbol, side, pos.get("entry_price") or trade.get("entry_price") or 0, pos.get("leverage") or trade.get("leverage") or Config.DEFAULT_LEVERAGE)
+            sl_pct, _ = get_dynamic_limits(symbol, side, pos.get("entry_price") or trade.get("entry_price") or 0, pos.get("leverage") or trade.get("leverage") or Config.DEFAULT_LEVERAGE)
+            # TP has no ceiling - let exchange TP handle profit, software only guards loss
             reason = None
             if roi <= -sl_pct:
                 reason = "max_loss"
-            elif roi >= tp_pct:
-                reason = "max_profit"
             if not reason:
                 continue
             logger.info(f"{reason} triggered for trade {trade['id']}: ROI {roi:.2f}%")

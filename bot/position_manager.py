@@ -608,7 +608,11 @@ class PositionManager:
         strength_factor = 0.5 + max(0.0, min(1.0, signal_strength))
         tp_multiplier = 1.5 + (confidence / 100) * 2.0
         sl_multiplier = 1.0 + ((100 - confidence) / 100) * 1.5
-        tp_distance = min(atr * tp_multiplier * strength_factor, entry_price * 0.15)
+        # No hard ceiling for TP - let strong signals run to 50% price move (up to 1250% ROI at 25x)
+        # Previous 0.15 cap limited TP to 15% price move, user wants dynamic 100-1000 ROI no ceiling
+        tp_distance = atr * tp_multiplier * strength_factor
+        # Allow up to 50% price move for TP, no 15% cap
+        tp_distance = min(tp_distance, entry_price * 0.5)
         sl_distance = max(atr * sl_multiplier / strength_factor, entry_price * 0.005)
 
         # A pure ATR stop can sit beyond the liquidation price at high leverage,
