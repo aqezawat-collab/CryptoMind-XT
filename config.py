@@ -107,7 +107,10 @@ class Config:
         missing = []
         # XT creds can come from env OR ~/.xt-tradekit/credentials.json, so not strictly required here
         # AI key: either AI_API_KEY or ANTHROPIC_API_KEY must be present
-        if not cls.AI_API_KEY and not cls.ANTHROPIC_API_KEY:
+        # For local LLM (localhost/127.0.0.1/trycloudflare) key is not needed - allow dummy
+        base = (cls.get_effective_base_url() or "").lower()
+        is_local = any(x in base for x in ("localhost", "127.0.0.1", "trycloudflare.com", "railway.internal"))
+        if not cls.AI_API_KEY and not cls.ANTHROPIC_API_KEY and not is_local:
             missing.append("AI_API_KEY or ANTHROPIC_API_KEY")
         if not cls.TELEGRAM_BOT_TOKEN:
             missing.append("TELEGRAM_BOT_TOKEN")
