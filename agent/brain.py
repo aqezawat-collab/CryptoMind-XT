@@ -59,9 +59,10 @@ class Brain:
         if self.provider == "anthropic":
             try:
                 from anthropic import Anthropic
-                # Anthropic SDK supports custom base_url via base_url param
+                # For local allow dummy key
+                akey = self.api_key or "sk-local-dummy"
                 self._anthropic_client = Anthropic(
-                    api_key=self.api_key,
+                    api_key=akey,
                     base_url=self.base_url if self.base_url != "https://api.anthropic.com" else None,
                 )
                 logger.info(f"Brain init: anthropic base_url={self.base_url}")
@@ -74,8 +75,9 @@ class Brain:
 
     def _init_openai_client(self):
         from openai import OpenAI
-        # For openai-compatible, base_url can be any
-        self._client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        # For local LLM (localhost/trycloudflare) allow empty key - use dummy so SDK doesn't throw Missing credentials
+        api_key = self.api_key or "sk-local-dummy"
+        self._client = OpenAI(api_key=api_key, base_url=self.base_url)
         logger.info(f"Brain init: openai-compatible base_url={self.base_url}")
 
     # ---- model resolution ----
